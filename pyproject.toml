@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saltrss"
+version = "0.1.0"
+description = "End-to-end 1D reduction of SALT RSS longslit pipeline products: sky subtraction, flux calibration, telluric correction, dereddening"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = {text = "BSD-3-Clause"}
+authors = [{name = "Xander Hall", email = "xjh@andrew.cmu.edu"}]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "astropy>=6.0",
+    "specutils>=2.0",
+    "specreduce>=1.5",
+    "pypeit>=2.0",
+    "astroscrappy>=1.2",
+    "extinction>=0.4",
+    "dustmaps>=1.0.13",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+skycalc = ["skycalc_ipy>=0.5"]
+typesafe = ["typesafe"]
+test = ["pytest>=7"]
+
+[project.scripts]
+saltrss-reduce = "saltrss.cli:main_reduce"
+saltrss-sensfunc = "saltrss.cli:main_sensfunc"
+saltrss-list = "saltrss.cli:main_list"
+
+[tool.setuptools.packages.find]
+include = ["saltrss*"]
+
+[tool.setuptools.package-data]
+saltrss = ["data/*.dat"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "realdata: tests that need the real SALT data tree (skipped when absent)",
+    "network: tests that download pypeit/dustmaps reference files",
+    "slow: slow tests",
+]
