@@ -264,7 +264,8 @@ def reduce_frame(frame_path, product: ProductDir | str | Path, *, output=None, o
     return result
 
 
-def reduce(product_dir, output=None, *, science_file=None, combine: bool = True, **kwargs) -> list[ReductionResult]:
+def reduce(product_dir, output=None, *, science_file=None, combine: bool = True,
+           upload=None, **kwargs) -> list[ReductionResult]:
     """Reduce every rectified science frame in a product directory.
 
     Parameters
@@ -278,6 +279,11 @@ def reduce(product_dir, output=None, *, science_file=None, combine: bool = True,
     combine : bool
         If several frames share a configuration, also write an
         inverse-variance weighted combination ``<object>_combined_<config>.csv``.
+    upload : saltrss.skyportal.UploadOptions, optional
+        When given, the finished spectra are posted to SkyPortal/Fritz once the
+        reduction is complete (the combined spectrum when there is one).  The
+        API token comes from ``$FRITZ_TOKEN``; an upload failure is logged but
+        never fails the reduction.
     **kwargs
         Passed to :func:`reduce_frame`.
 
@@ -320,6 +326,15 @@ def reduce(product_dir, output=None, *, science_file=None, combine: bool = True,
             comb.write_csv(path, include_mask=kwargs.get("include_mask", False))
             log.info("Wrote combined spectrum %s", path)
             grp[0].outputs["combined_csv"] = path
+            grp[0].qa["combined_spectrum"] = comb
+            grp[0].qa["combined_members"] = grp
+    if upload is not None:
+        from .skyportal import SkyPortalError, upload_results
+
+        try:
+            upload_results(results, upload)
+        except SkyPortalError as exc:  # a reduction is worth keeping even if the upload is not possible
+            log.error("SkyPortal upload skipped: %s", exc)
     return results
 
 

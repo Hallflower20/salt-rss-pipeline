@@ -21,6 +21,7 @@ It is deliberately thin: the numerical work is done by established packages.
 | Cosmic rays (optional) | `astroscrappy` |
 | Milky Way reddening | `dustmaps` (SFD/Planck/CSFD) + `extinction` (Fitzpatrick 99, CCM 89, …) |
 | QA judgment (optional) | TypeSafe System One (`typesafe-sdk`) |
+| Publication to SkyPortal/Fritz | `POST /api/spectrum` (`saltrss.skyportal`) |
 
 ## Installation
 
@@ -69,8 +70,10 @@ Useful options: `--science-file`, `--trace-guess ROW` or
 `--target-selection brightest` (which object on the slit), `--standard-file` /
 `--sensfunc file.fits`, `--telluric skycalc|none`, `--ebv 0.05`,
 `--extract-method boxcar`, `--typesafe` (experimental QA verdict from TypeSafe;
-needs `TYPESAFE_API_KEY` or `JEV_API_KEY`), `--include-mask`. `saltrss-list DIR [--standards]` shows frames and
-configurations; `saltrss-sensfunc` builds a reusable sensitivity function.
+needs `TYPESAFE_API_KEY` or `JEV_API_KEY`), `--include-mask`, `--upload` (see
+below). `saltrss-list DIR [--standards]` shows frames and
+configurations; `saltrss-sensfunc` builds a reusable sensitivity function;
+`saltrss-upload` posts a finished spectrum to SkyPortal.
 
 ### Python
 
@@ -96,6 +99,72 @@ counts = extract(frame, trace_guess=1012).spectrum
 CSV columns: `wavelength` (Å, **air**, the SALT pipeline's native system),
 `flux` and `fluxerr` (erg s⁻¹ cm⁻² Å⁻¹). Bad pixels (CCD gaps, opaque telluric
 pixels, masked columns) are written as NaN; `--include-mask` adds a 0/1 column.
+
+## Uploading to SkyPortal / Fritz
+
+A finished spectrum can be posted to a SkyPortal instance (default
+`https://fritz.science/`) as soon as the reduction is done:
+
+```bash
+export FRITZ_TOKEN=<your API token>        # in ~/.bash_profile
+saltrss-reduce /path/to/<object>/<night>_RSS -o out/ --upload --group "SALT Transients"
+```
+
+or later, from the product file:
+
+```bash
+saltrss-upload out/AT2025vjw_*.fits --group "SALT Transients" --sitewide
+```
+
+The upload shows exactly what it is about to post and asks for confirmation
+(`--dry-run` stops after showing it, `--yes` skips the question — required when
+stdin is not a terminal). `saltrss-upload --list-groups`, `--list-instruments`
+and `--whoami` answer the questions you need to fill the other options. The
+existence of the source is checked before anything is posted: SALT's `OBJECT`
+keyword is the TNS name, which is often not the instance's source name
+(`AT2025vjw` is `ZTF25ablxhsq` on Fritz), so a cone search around the frame
+coordinates names the candidates — `--resolve-obj-id` takes the match when there
+is exactly one, otherwise pick it with `--obj-id`.
+
+SALT's instrument on Fritz is called simply `Spectrograph` (telescope `SALT`),
+not `RSS`, so the default `--instrument SALT/Spectrograph` is qualified by the
+telescope; a bare name works too when it is unique on the instance.
+
+| Option | Meaning |
+| --- | --- |
+| `--endpoint URL` | SkyPortal instance, default `https://fritz.science/` |
+| `--group NAME_OR_ID` | share with this group; repeat for several. Names, nicknames and ids all work. Without any, SkyPortal applies the token owner's default sharing groups |
+| `--sitewide` | *also* share with the instance's sitewide (public) group — visible to **every** user |
+| `--obj-id` | source name on SkyPortal; defaults to the `OBJECT` header keyword |
+| `--resolve-obj-id`, `--match-radius` | when that name is not a source on the instance, take the one within `--match-radius` (3″) of the frame coordinates |
+| `--instrument` / `--instrument-id` | instrument, as `<telescope>/<instrument>` or a bare name (default `SALT/Spectrograph`, which is id 40 on Fritz), or its id |
+| `--spectrum-type`, `--label`, `--origin` | SkyPortal spectrum type (e.g. `source`), plot-legend label, origin string |
+| `--reduced-by`, `--observed-by`, `--pi` | credit SkyPortal users (`me` resolves to the token owner); an `--external-…` free-text name needs one of these as point of contact |
+| `--upload-frames` | post each frame instead of their inverse-variance combination (the default when frames of one configuration were combined) |
+
+Masked pixels (CCD gaps, opaque telluric bands) are dropped rather than sent as
+NaN, points go up in wavelength, and `units` is set to `erg/s/cm/cm/AA`. The
+provenance of the reduction — configuration, exposure, standard star and its
+zeropoint rms, telluric method, E(B-V), trace row, and that the wavelengths are
+**air** — travels with the spectrum in `altdata`.
+
+### The token
+
+The token is read from `$FRITZ_TOKEN` (then `$SKYPORTAL_TOKEN`, or
+`--token-file`). There is deliberately **no `--token` option**, so it cannot end
+up in your shell history or in `ps` output. It is sent only in the
+`Authorization` header, and never appears in a log line, an error message, a
+`repr`, or any output product; a non-HTTPS endpoint is refused outright
+(`--allow-insecure` is for a local test instance). Keep it out of the
+repository: `saltrss` never writes it anywhere.
+
+```python
+from saltrss.skyportal import UploadOptions
+import saltrss
+
+saltrss.reduce("/data/SALT/AT2025vjw/20250925_RSS", output="out/",
+               upload=UploadOptions(groups=["SALT Transients"], sitewide=False))
+```
 
 ## Caveats
 
@@ -143,7 +212,8 @@ saltrss/
   reddening.py  ebv_from_dustmaps(), deredden()
   pipeline.py   reduce(), reduce_frame(), get_sensfunc(), combine_spectra()
   qa.py         plot_reduction(), typesafe_review()
-  io.py         multi-extension FITS output
-  cli.py        saltrss-reduce / saltrss-sensfunc / saltrss-list
+  io.py         multi-extension FITS output, product read-back
+  skyportal.py  SkyPortal/Fritz client, payload building, upload
+  cli.py        saltrss-reduce / saltrss-sensfunc / saltrss-list / saltrss-upload
   data/suth_extinct.dat   Sutherland extinction (PySALT, BSD)
 ```

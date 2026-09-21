@@ -21,6 +21,7 @@ dependencies = [
     "extinction>=0.4",
     "dustmaps>=1.0.13",
     "matplotlib>=3.7",
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,7 @@ test = ["pytest>=7"]
 saltrss-reduce = "saltrss.cli:main_reduce"
 saltrss-sensfunc = "saltrss.cli:main_sensfunc"
 saltrss-list = "saltrss.cli:main_list"
+saltrss-upload = "saltrss.cli:main_upload"
 
 [tool.setuptools.packages.find]
 include = ["saltrss*"]

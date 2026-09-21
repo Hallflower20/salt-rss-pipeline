@@ -16,6 +16,8 @@ def write_fits_result(result, path: Path | str) -> None:
     hdr = fits.Header()
     hdr["OBJECT"] = info.object
     hdr["DATE-OBS"] = info.date_obs
+    if info.jd:
+        hdr["MJD-OBS"] = (info.jd - 2400000.5, "MJD at the start of the exposure (UTC)")
     hdr["EXPTIME"] = info.exptime
     hdr["AIRMASS"] = info.airmass
     hdr["RA_DEG"] = info.ra_deg
@@ -56,3 +58,37 @@ def write_fits_result(result, path: Path | str) -> None:
         hdus.append(fits.BinTableHDU(Table({"wave": s.wave, "zeropoint": s.zeropoint, "gpm": s.gpm.astype(np.int8)}),
                                      name="SENSFUNC"))
     fits.HDUList(hdus).writeto(path, overwrite=True)
+
+
+def read_spectrum_product(path: Path | str):
+    """Read back a saltrss product written by :func:`write_fits_result` (or a CSV).
+
+    Returns ``(Spectrum1D, header)``; ``header`` is None for a CSV.  Used to
+    re-upload an already reduced spectrum without redoing the reduction.
+    """
+    from .spectrum import Spectrum1D
+
+    path = Path(path)
+    if path.suffix.lower() in (".csv", ".txt", ".dat"):
+        tab = Table.read(path, format="ascii.csv")
+        cols = {c.lower(): c for c in tab.colnames}
+        wave = np.asarray(tab[cols["wavelength"]], dtype=float)
+        flux = np.asarray(tab[cols["flux"]], dtype=float)
+        err = np.asarray(tab[cols["fluxerr"]], dtype=float) if "fluxerr" in cols else np.full_like(flux, np.nan)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ivar = np.where(np.isfinite(err) & (err > 0), 1.0 / err ** 2, 0.0)
+        gpm = np.isfinite(flux)
+        if "mask" in cols:
+            gpm &= np.asarray(tab[cols["mask"]], dtype=int) == 0
+        return Spectrum1D(wave, np.nan_to_num(flux), ivar, gpm, unit="erg/s/cm2/A"), None
+    with fits.open(path) as hdul:
+        hdr = hdul[0].header
+        tab = Table(hdul["SPECTRUM"].data)
+        wave = np.asarray(tab["wavelength"], dtype=float)
+        flux = np.asarray(tab["flux"], dtype=float)
+        err = np.asarray(tab["fluxerr"], dtype=float)
+        gpm = np.asarray(tab["mask"], dtype=int) == 0 if "mask" in tab.colnames else np.isfinite(flux)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ivar = np.where(np.isfinite(err) & (err > 0), 1.0 / err ** 2, 0.0)
+        return Spectrum1D(wave, np.nan_to_num(flux), ivar, gpm & np.isfinite(flux),
+                          unit=str(hdr.get("FLUXUNIT", "erg/s/cm2/A")).strip()), hdr
