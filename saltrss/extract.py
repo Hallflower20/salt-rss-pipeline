@@ -8,6 +8,7 @@ import numpy as np
 from astropy import units as u
 from astropy.modeling import fitting, models
 from astropy.nddata import NDData, VarianceUncertainty
+from astropy.stats import sigma_clip
 from scipy.ndimage import median_filter
 from specreduce.background import Background
 from specreduce.extract import BoxcarExtract
@@ -80,10 +81,28 @@ def _fit_gaussian_fwhm(profile: np.ndarray, center: float, halfwidth: int = 25) 
     return float(np.clip(fwhm, 1.5, 2 * halfwidth))
 
 
+def _clipped_trace(ft: FitTrace, degree: int, nx: int, clip_sigma: float) -> np.ndarray | None:
+    """Refit `FitTrace`'s bin centroids with outlier rejection (FitTrace itself does not clip).
+
+    Returns the trace over all ``nx`` columns, or None if the bin peaks are
+    unavailable or too few to clip (the caller then keeps ``ft.trace``).
+    """
+    if clip_sigma <= 0 or not hasattr(ft, "_bin_peaks"):
+        return None
+    x, y = (np.asarray(a, dtype=float) for a in ft._bin_peaks)
+    ok = np.isfinite(y)
+    if ok.sum() < degree + 3:
+        return None
+    fitter = fitting.FittingWithOutlierRemoval(fitting.LinearLSQFitter(), sigma_clip, niter=5,
+                                               sigma=clip_sigma, stdfunc="mad_std")
+    model, _ = fitter(models.Polynomial1D(degree=degree), x[ok], y[ok])
+    return np.asarray(model(np.arange(nx, dtype=float)), dtype=float)
+
+
 def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bins: int = 40,
-               degree: int = 2, disp_frac=(0.15, 0.85), peak_method: str = "gaussian",
+               degree: int = 1, disp_frac=(0.15, 0.85), peak_method: str = "gaussian",
                expected_row: float | None = None, search_window: float = 60.0,
-               target_selection: str = "expected") -> TraceResult:
+               target_selection: str = "expected", clip_sigma: float = 3.0) -> TraceResult:
     """Locate and trace the target along the dispersion axis.
 
     Parameters
@@ -103,7 +122,13 @@ def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bin
     window : int
         Half-width (rows) of the trace-fitting window around the guess.
     bins, degree, peak_method
-        Passed to `specreduce.tracing.FitTrace`.
+        Passed to `specreduce.tracing.FitTrace`.  The default ``degree=1`` (a
+        straight, possibly tilted trace) is deliberate: on SALT ``_wr`` frames the
+        measured curvature is < 0.3 rows, while a quadratic chases noise on faint
+        targets and extrapolates badly outside ``disp_frac``.
+    clip_sigma : float
+        Bin centroids more than ``clip_sigma`` robust sigma from the fitted trace
+        are rejected (iteratively) before the final fit; ``0`` disables clipping.
     """
     import logging
 
@@ -134,8 +159,10 @@ def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bin
     c0, c1 = int(disp_frac[0] * nx), int(disp_frac[1] * nx)
     ft = FitTrace(nd, bins=bins, guess=float(guess), window=int(window),
                   trace_model=models.Polynomial1D(degree=degree), peak_method=peak_method,
-                  disp_bounds=(c0, c1))
-    positions = np.asarray(np.ma.filled(ft.trace, np.nan), dtype=float)
+                  disp_bounds=(c0, c1), _save_bin_peaks_testing=True)
+    positions = _clipped_trace(ft, degree, nx, clip_sigma)
+    if positions is None:
+        positions = np.asarray(np.ma.filled(ft.trace, np.nan), dtype=float)
     if not np.all(np.isfinite(positions)):
         positions = np.where(np.isfinite(positions), positions, float(guess))
     if np.any(np.abs(positions - guess) > window):

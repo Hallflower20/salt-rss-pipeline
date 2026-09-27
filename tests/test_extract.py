@@ -82,3 +82,23 @@ def test_undetected_target_uses_straight_trace(std_frame):
     assert np.all(tr.positions == 20.0) or np.all(np.abs(tr.positions - 20.0) <= 8)
     ex = extract(std_frame, tr)           # must not raise "background regions overlapped"
     assert ex.spectrum.wave.size == std_frame.shape[1]
+
+
+def test_tilted_trace_is_straight_and_clips_bad_bins(std_frame):
+    """A tilted trace is fitted by a line; a few corrupted bins are rejected, not chased."""
+    from saltrss.frames import Frame2D
+
+    rng = np.random.default_rng(1)
+    ny, nx = 120, 400
+    x, y = np.arange(nx), np.arange(ny)[:, None]
+    true = 54.0 + 12.0 * x / (nx - 1)                     # 12-row tilt across the frame
+    row = np.broadcast_to(true, (ny, nx)).copy()
+    row[:, 150:170] += 7.0                                # two bins pulled 7 rows off the trace
+    row[:, 250:260] -= 7.0                                # and one the other way
+    data = 500.0 * np.exp(-0.5 * ((y - row) / STAR_SIGMA) ** 2) + rng.normal(0, 1.0, (ny, nx))
+    fr = Frame2D(data, np.ones((ny, nx)), np.zeros((ny, nx), bool), std_frame.wave[:nx], std_frame.info)
+
+    tr = find_trace(fr, guess=60.0)
+    assert np.max(np.abs(tr.positions - true)) < 0.3
+    unclipped = find_trace(fr, guess=60.0, clip_sigma=0)
+    assert np.max(np.abs(unclipped.positions - true)) > np.max(np.abs(tr.positions - true))
