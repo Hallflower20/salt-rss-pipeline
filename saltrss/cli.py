@@ -17,6 +17,15 @@ def _common_logging(verbose: bool) -> None:
         logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
+def _rows(text: str) -> tuple[int, int]:
+    """argparse type for an inclusive row range ``FIRST:LAST``."""
+    try:
+        lo, hi = (int(v) for v in text.split(":"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected FIRST:LAST rows, e.g. 499:504, got {text!r}") from None
+    return lo, hi
+
+
 def main_reduce(argv=None) -> int:
     from .pipeline import STANDARDS_ENV, reduce
 
@@ -40,6 +49,12 @@ def main_reduce(argv=None) -> int:
                    help="'expected': brightest peak within 60 rows of the standard star's row / slit centre "
                         "(default); 'brightest': brightest object anywhere on the slit")
     p.add_argument("--expected-row", type=float, help="expected target row (default: standard star's row)")
+    p.add_argument("--trace-rows", type=_rows, metavar="FIRST:LAST",
+                   help="search for and fit the trace only within these rows, e.g. 495:530 (keeps a brighter "
+                        "neighbour from capturing it; overrides --target-selection)")
+    p.add_argument("--sky-rows", type=_rows, action="append", metavar="FIRST:LAST",
+                   help="use these rows as sky instead of the automatic windows; repeat for each window, "
+                        "e.g. --sky-rows 499:504 --sky-rows 519:524")
     p.add_argument("--extract-method", default="horne", choices=["horne", "boxcar"])
     p.add_argument("--profile-order", type=int, default=4, help="polynomial order smoothing the Horne spatial profile")
     p.add_argument("--aperture-fwhm", type=float, default=2.5)
@@ -62,6 +77,7 @@ def main_reduce(argv=None) -> int:
                      workdir=a.workdir, telluric=a.telluric, deredden=a.deredden or a.ebv is not None, ebv=a.ebv,
                      dustmap=a.dustmap, r_v=a.rv, extinction_law=a.extinction_law, trace_guess=a.trace_guess,
                      target_selection=a.target_selection, expected_row=a.expected_row,
+                     trace_rows=a.trace_rows, sky_rows=a.sky_rows,
                      extract_method=a.extract_method, profile_order=a.profile_order, aperture_fwhm=a.aperture_fwhm,
                      sky_sep_fwhm=a.sky_sep_fwhm, sky_width=a.sky_width, readnoise=a.readnoise,
                      atm_extinction=a.atm_extinction, write_fits=not a.no_fits, qa_plot=not a.no_qa,

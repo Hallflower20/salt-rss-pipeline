@@ -22,8 +22,19 @@ def test_reduce_cli(synthetic_product, tmp_path, reference_spectrum, monkeypatch
     rc = cli.main_reduce([str(synthetic_product), "--science-file",
                           str(synthetic_product / "mbxgpP202501010011_bp_ag_ff_cr_cg_wr.fits"),
                           "-o", str(out), "--sensfunc", str(sens), "--telluric", "none", "--no-fits", "--no-qa",
-                          "--include-mask"])
+                          "--include-mask", "--trace-rows", "45:75", "--sky-rows", "25:40", "--sky-rows", "80:95"])
     assert rc == 0 and out.exists()
     tab = Table.read(out, format="ascii.csv")
     assert tab.colnames == ["wavelength", "flux", "fluxerr", "mask"]
     assert "median S/N" in capsys.readouterr().out
+
+
+def test_rows_argument():
+    import argparse
+
+    import pytest
+
+    assert cli._rows("499:504") == (499, 504)
+    for bad in ("499", "499-504", "a:b", "1:2:3"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            cli._rows(bad)

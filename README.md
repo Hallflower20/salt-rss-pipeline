@@ -67,13 +67,40 @@ This
    model, sky, zeropoint) and `spectrum.png` (QA figure).
 
 Useful options: `--science-file`, `--trace-guess ROW` or
-`--target-selection brightest` (which object on the slit), `--standard-file` /
+`--target-selection brightest` (which object on the slit), `--trace-rows` /
+`--sky-rows` (see below), `--standard-file` /
 `--sensfunc file.fits`, `--telluric skycalc|none`, `--ebv 0.05`,
 `--extract-method boxcar`, `--typesafe` (experimental QA verdict from TypeSafe;
 needs `TYPESAFE_API_KEY` or `JEV_API_KEY`), `--include-mask`, `--upload` (see
 below). `saltrss-list DIR [--standards]` shows frames and
 configurations; `saltrss-sensfunc` builds a reusable sensitivity function;
 `saltrss-upload` posts a finished spectrum to SkyPortal.
+
+### A brighter star next to the target
+
+When a brighter star sits within 60 rows of the target, the automatic selection
+takes the star, and even `--trace-guess` can be pulled onto it. Give the rows
+that hold the target, and sky rows that avoid the star:
+
+```bash
+saltrss-reduce /path/to/<object>/<night>_RSS -o out/ \
+    --trace-rows 495:530 --sky-rows 488:500 --sky-rows 524:560
+```
+
+* `--trace-rows FIRST:LAST` restricts both the search and the trace fit to those
+  rows, so nothing outside them is seen; the brightest peak inside is traced.
+* `--sky-rows FIRST:LAST` (repeat for each window) replaces the automatic sky
+  windows, which would otherwise straddle the neighbour. Windows can have any
+  width and sit on either side. The rows apply at the trace's median row and the
+  windows follow a tilted trace in whole rows. You get a warning if a sky row
+  falls inside the object aperture, and also when a detected object falls in
+  the sky windows, which is how such cases announce themselves.
+
+Rows are 0-based rows of the rectified science frame, in its binning, as in the
+QA figure's spatial profile (where the trace rows are drawn as dotted lines).
+The options apply to every science frame reduced in the run and never to the
+standard star. They are recorded as `TRCROWS` / `SKYROWS` in the FITS header.
+In Python: `reduce(..., trace_rows=(495, 530), sky_rows=[(488, 500), (524, 560)])`.
 
 ### Python
 

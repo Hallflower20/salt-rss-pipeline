@@ -102,3 +102,110 @@ def test_tilted_trace_is_straight_and_clips_bad_bins(std_frame):
     assert np.max(np.abs(tr.positions - true)) < 0.3
     unclipped = find_trace(fr, guess=60.0, clip_sigma=0)
     assert np.max(np.abs(unclipped.positions - true)) > np.max(np.abs(tr.positions - true))
+
+
+def _with_neighbour(frame, row, factor=5.0):
+    """Copy of ``frame`` with a star ``factor`` times brighter than the target at ``row``."""
+    import copy
+
+    fr = copy.deepcopy(frame)
+    peak = np.median(frame.data[int(STAR_ROW)] - frame.data[int(STAR_ROW) + 30])
+    y = np.arange(fr.shape[0], dtype=float)[:, None]
+    fr.data = fr.data + factor * peak * np.exp(-0.5 * ((y - row) / STAR_SIGMA) ** 2)
+    return fr
+
+
+def test_trace_rows_keep_a_brighter_neighbour_out(std_frame):
+    """A brighter star within the search window wins unless the trace is confined to the target's rows."""
+    fr = _with_neighbour(std_frame, 30.0)
+    assert abs(find_trace(fr, expected_row=STAR_ROW).center - 30) < 1     # the problem
+    tr = find_trace(fr, expected_row=STAR_ROW, trace_rows=(48, 72))
+    assert abs(tr.center - STAR_ROW) < 0.5 and tr.rows == (48, 72)
+    assert np.all(np.abs(tr.positions - STAR_ROW) < 1.0)
+    # also when the guess is given: the fit cannot be pulled out of the rows
+    assert abs(find_trace(fr, guess=60, trace_rows=(72, 48)).center - STAR_ROW) < 0.5
+
+
+def test_trace_rows_validation(std_frame):
+    with pytest.raises(ValueError, match="outside trace_rows"):
+        find_trace(std_frame, guess=30, trace_rows=(48, 72))
+    with pytest.raises(ValueError, match="too narrow"):
+        find_trace(std_frame, trace_rows=(58, 62))
+    with pytest.raises(ValueError, match="off the frame"):
+        find_trace(std_frame, trace_rows=(100, 130))
+    with pytest.raises(ValueError, match="pair of rows"):
+        find_trace(std_frame, trace_rows=(60,))
+
+
+def test_sky_rows_keep_a_neighbour_out_of_the_sky(std_frame, caplog):
+    fr = _with_neighbour(std_frame, 30.0)
+    clean = extract(std_frame).spectrum
+    g = clean.gpm & (clean.flux > 0.2 * np.median(clean.flux))
+    with caplog.at_level("WARNING", logger="saltrss"):
+        extract(fr, trace_rows=(48, 72))                  # lower automatic sky window holds the neighbour
+    assert "Object(s) at row(s) [30] fall in the sky windows" in caplog.text
+    sky_rows = [(42, 50), (70, 78)]
+    ex = extract(fr, trace_rows=(48, 72), sky_rows=sky_rows, aperture_fwhm=2.0)
+    assert ex.sky_windows == ((42.0, 50.0), (70.0, 78.0)) and ex.meta["sky_rows"] == sky_rows
+    assert abs(np.median(ex.spectrum.flux[g] / clean.flux[g]) - 1) < 0.02
+    # the sky is the (clipped) median of exactly those rows
+    rows = np.r_[42:51, 70:79]
+    ref = np.median(std_frame.data[rows], axis=0)
+    assert np.median(np.abs(ex.sky.flux / ref - 1)) < 0.01
+
+
+def test_sky_rows_validation(std_frame, caplog):
+    with pytest.raises(ValueError, match="off the frame"):
+        extract(std_frame, sky_rows=[(110, 125)])
+    with pytest.raises(ValueError, match="empty"):
+        extract(std_frame, sky_rows=[])
+    with caplog.at_level("WARNING", logger="saltrss"):
+        extract(std_frame, sky_rows=[(30, 40), (62, 70)])
+    assert "inside the" in caplog.text
+
+
+def _tilted_frame(std_frame, true, nx=400, ny=120, amp=500.0):
+    from saltrss.frames import Frame2D
+
+    rng = np.random.default_rng(2)
+    y = np.arange(ny)[:, None]
+    data = amp * np.exp(-0.5 * ((y - true) / STAR_SIGMA) ** 2) + rng.normal(0, 1.0, (ny, nx))
+    return Frame2D(data, np.ones((ny, nx)), np.zeros((ny, nx), bool), std_frame.wave[:nx], std_frame.info)
+
+
+def test_sky_rows_follow_a_tilted_trace(std_frame):
+    """Sky rows apply at the trace centre and shift with the trace, keeping their clearance."""
+    nx = 400
+    true = 54.0 + 12.0 * np.arange(nx) / (nx - 1)          # 12-row tilt, centre row 60
+    ex = extract(_tilted_frame(std_frame, true), sky_rows=[(46, 50), (70, 74)], aperture_fwhm=2.0)
+    assert np.max(np.abs(ex.trace.positions - true)) < 0.3
+    # fixed rows 46-50 would sit 4-8 rows (< 2 sigma at the near edge) from the star at the left end
+    assert np.max(np.abs(ex.sky.flux)) < 2.0
+
+
+def test_trace_ignores_a_run_of_lost_bins(std_frame):
+    """Bins where a faint target vanishes (here: another source takes over) must not tilt the trace."""
+    nx = 400
+    true = np.where(np.arange(nx) < 130, 54.0, STAR_ROW)    # first quarter of the traced range at row 54
+    tr = find_trace(_tilted_frame(std_frame, true), guess=STAR_ROW)
+    assert np.all(np.abs(tr.positions - STAR_ROW) < 0.3)
+    unclipped = find_trace(_tilted_frame(std_frame, true), guess=STAR_ROW, clip_sigma=0)
+    assert np.max(np.abs(unclipped.positions - STAR_ROW)) > 1.0
+
+
+def test_clipped_trace_ignores_fallback_bins_and_keeps_real_curvature():
+    """Patterns seen on real frames (2026ofr, AT2025adgo) for the robust start of the trace fit."""
+    from types import SimpleNamespace
+
+    from saltrss.extract import _clipped_trace
+
+    x = np.linspace(500, 2700, 40)
+    # undetected target: FitTrace repeats the last successful bin for every failed one, so
+    # there are only three measurements and the caller keeps FitTrace's own (flagged) fit
+    y = np.r_[[1148.1] * 10, [1002.6] * 25, [1030.0] * 5]
+    assert _clipped_trace(SimpleNamespace(_bin_peaks=(x, y)), 1, 3172, 3.0, fwhm=5.1) is None
+    # bright, slightly curved trace: bins 2.5 rows off a line (< FWHM/2) are not discarded up front
+    y = 1006.0 - 0.0025 * (x - 1600) + np.where(x < 850, 2.5, 0.0)
+    pos = _clipped_trace(SimpleNamespace(_bin_peaks=(x, y)), 1, 3172, 3.0, fwhm=13.2)
+    lsq = np.polyval(np.polyfit(x, y, 1), np.arange(3172))
+    assert np.allclose(pos, lsq, atol=0.05)

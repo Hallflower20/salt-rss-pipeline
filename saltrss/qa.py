@@ -34,6 +34,10 @@ def plot_reduction(result, path: Path | str) -> None:
         for w in ex.sky_windows:
             ax.axvspan(*w, color="C0", alpha=0.15)
         ax.plot([], [], color="C0", alpha=0.4, lw=8, label="sky windows")
+    if tr.rows is not None:
+        for r in tr.rows:
+            ax.axvline(r, color="C2", ls=":", lw=1)
+        ax.plot([], [], color="C2", ls=":", label=f"trace rows {tr.rows[0]}:{tr.rows[1]}")
     ax.set_xlim(max(tr.center - 150, 0), min(tr.center + 150, tr.profile.size))
     ax.set_xlabel("row"); ax.set_ylabel("median counts"); ax.legend(fontsize=8); ax.set_title("spatial profile")
 

@@ -1,6 +1,7 @@
 """Object tracing, sky subtraction and 1D extraction (thin wrapper around specreduce)."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,8 +9,9 @@ import numpy as np
 from astropy import units as u
 from astropy.modeling import fitting, models
 from astropy.nddata import NDData, VarianceUncertainty
-from astropy.stats import sigma_clip
+from astropy.stats import mad_std, sigma_clip
 from scipy.ndimage import median_filter
+from scipy.stats import theilslopes
 from specreduce.background import Background
 from specreduce.extract import BoxcarExtract
 from specreduce.tracing import ArrayTrace, FitTrace
@@ -27,6 +29,7 @@ class TraceResult:
     guess: float           # starting row
     profile: np.ndarray    # collapsed spatial profile used to find the object
     peaks: list[float] = field(default_factory=list)  # candidate object rows, brightest first
+    rows: tuple[int, int] | None = None  # row range the trace was confined to (``trace_rows``)
 
     @property
     def center(self) -> float:
@@ -41,6 +44,17 @@ class ExtractionResult:
     sky_windows: tuple[tuple[float, float], ...] | None
     aperture: tuple[float, float] | None
     meta: dict[str, Any] = field(default_factory=dict)
+
+
+def row_range(rows, nrows: int, name: str = "rows") -> tuple[int, int]:
+    """Validate an inclusive ``(first, last)`` row range on a frame with ``nrows`` rows."""
+    try:
+        lo, hi = sorted(int(round(float(r))) for r in rows)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a (first, last) pair of rows, got {rows!r}") from None
+    if lo < 0 or hi > nrows - 1:
+        raise ValueError(f"{name} {lo}:{hi} is off the frame (rows 0-{nrows - 1})")
+    return lo, hi
 
 
 def spatial_profile(frame: Frame2D, disp_frac=(0.2, 0.8)) -> np.ndarray:
@@ -81,18 +95,38 @@ def _fit_gaussian_fwhm(profile: np.ndarray, center: float, halfwidth: int = 25) 
     return float(np.clip(fwhm, 1.5, 2 * halfwidth))
 
 
-def _clipped_trace(ft: FitTrace, degree: int, nx: int, clip_sigma: float) -> np.ndarray | None:
+def _bin_peaks(ft: FitTrace):
+    """`FitTrace`'s bin centres and centroids, and which centroids are measurements.
+
+    A bin whose Gaussian fit fails gets the value of the last bin that succeeded:
+    such exact repeats are not measurements.  None if the bin peaks are unavailable.
+    """
+    if not hasattr(ft, "_bin_peaks"):
+        return None
+    x, y = (np.asarray(a, dtype=float) for a in ft._bin_peaks)
+    return x, y, np.isfinite(y) & np.r_[True, y[1:] != y[:-1]]
+
+
+def _clipped_trace(ft: FitTrace, degree: int, nx: int, clip_sigma: float, fwhm: float) -> np.ndarray | None:
     """Refit `FitTrace`'s bin centroids with outlier rejection (FitTrace itself does not clip).
 
     Returns the trace over all ``nx`` columns, or None if the bin peaks are
     unavailable or too few to clip (the caller then keeps ``ft.trace``).
     """
-    if clip_sigma <= 0 or not hasattr(ft, "_bin_peaks"):
+    peaks = _bin_peaks(ft)
+    if clip_sigma <= 0 or peaks is None:
         return None
-    x, y = (np.asarray(a, dtype=float) for a in ft._bin_peaks)
-    ok = np.isfinite(y)
+    x, y, ok = peaks
     if ok.sum() < degree + 3:
         return None
+    # Start from a robust (Theil-Sen) line: a run of bins where a faint target is lost in
+    # the noise would otherwise tilt the first least-squares fit, and with it the clip level.
+    # Only bins more than half a FWHM off that line (not on the object) are dropped here.
+    slope, icpt, _, _ = theilslopes(y[ok], x[ok])
+    resid = y - (icpt + slope * x)
+    keep = ok & (np.abs(resid) <= max(clip_sigma * mad_std(resid[ok]), fwhm / 2))
+    if keep.sum() >= degree + 3:
+        ok = keep
     fitter = fitting.FittingWithOutlierRemoval(fitting.LinearLSQFitter(), sigma_clip, niter=5,
                                                sigma=clip_sigma, stdfunc="mad_std")
     model, _ = fitter(models.Polynomial1D(degree=degree), x[ok], y[ok])
@@ -102,13 +136,20 @@ def _clipped_trace(ft: FitTrace, degree: int, nx: int, clip_sigma: float) -> np.
 def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bins: int = 40,
                degree: int = 1, disp_frac=(0.15, 0.85), peak_method: str = "gaussian",
                expected_row: float | None = None, search_window: float = 60.0,
-               target_selection: str = "expected", clip_sigma: float = 3.0) -> TraceResult:
+               target_selection: str = "expected", clip_sigma: float = 3.0,
+               trace_rows: tuple[int, int] | None = None) -> TraceResult:
     """Locate and trace the target along the dispersion axis.
 
     Parameters
     ----------
     guess : float, optional
         Approximate row of the target; overrides the automatic selection.
+    trace_rows : (int, int), optional
+        Inclusive range of rows containing the target.  The brightest peak inside
+        it is taken (``expected_row`` and ``target_selection`` are ignored; the
+        middle of the range if nothing is detected) and the trace is fitted to
+        these rows alone, so a brighter object outside the range can capture
+        neither the selection nor the fit.  ``guess`` must lie inside it.
     expected_row : float, optional
         Where the target is expected (SALT acquires onto a fixed slit position,
         so the standard star's row or the slit centre is a good prior).
@@ -137,6 +178,21 @@ def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bin
     peaks = find_peaks(prof)
     if expected_row is None:
         expected_row = ny // 2
+    lo, hi = 0, ny - 1
+    if trace_rows is not None:
+        lo, hi = row_range(trace_rows, ny, "trace_rows")
+        if hi - lo < 6:
+            raise ValueError(f"trace_rows {lo}:{hi} is too narrow to fit a trace (need at least 7 rows)")
+        if guess is not None and not lo <= guess <= hi:
+            raise ValueError(f"trace guess {guess} lies outside trace_rows {lo}:{hi}")
+        if guess is None:
+            inside = [p for p in peaks if lo <= p <= hi]
+            if inside:
+                guess = inside[0]
+            else:
+                guess = (lo + hi) / 2
+                logging.getLogger("saltrss").warning(
+                    "No object detected within trace_rows %d:%d; tracing at row %.1f", lo, hi, guess)
     if guess is None:
         if target_selection == "brightest":
             if not peaks:
@@ -152,25 +208,39 @@ def find_trace(frame: Frame2D, guess: float | None = None, window: int = 25, bin
                     "tracing at the expected position", search_window, expected_row,
                     [round(p) for p in peaks[:4]])
                 guess = float(expected_row)
-    fwhm = _fit_gaussian_fwhm(prof, guess)
-    guess = float(np.clip(guess, 2, ny - 3))
-    window = int(max(3, min(window, guess - 1, ny - 2 - guess)))  # keep the search window on the frame
-    nd = frame.to_nddata()
+    # Everything below works on rows lo..hi only (the whole frame without trace_rows):
+    # FitTrace falls back on a Gaussian fitted to its entire image when a bin fails,
+    # which would otherwise land on any brighter object on the slit.
+    n = hi - lo + 1
+    fwhm = _fit_gaussian_fwhm(prof[lo:hi + 1], guess - lo)
+    guess = float(lo + np.clip(guess - lo, 3, n - 4))
+    g = guess - lo
+    window = int(max(3, min(window, g - 1, n - 2 - g)))  # keep the search window inside the rows
+    nd = frame.cutout(lo, hi + 1).to_nddata()
     c0, c1 = int(disp_frac[0] * nx), int(disp_frac[1] * nx)
-    ft = FitTrace(nd, bins=bins, guess=float(guess), window=int(window),
+    ft = FitTrace(nd, bins=bins, guess=g, window=int(window),
                   trace_model=models.Polynomial1D(degree=degree), peak_method=peak_method,
                   disp_bounds=(c0, c1), _save_bin_peaks_testing=True)
-    positions = _clipped_trace(ft, degree, nx, clip_sigma)
+    positions = _clipped_trace(ft, degree, nx, clip_sigma, fwhm)
     if positions is None:
         positions = np.asarray(np.ma.filled(ft.trace, np.nan), dtype=float)
+    positions = positions + lo
     if not np.all(np.isfinite(positions)):
         positions = np.where(np.isfinite(positions), positions, float(guess))
-    if np.any(np.abs(positions - guess) > window):
+    bp = _bin_peaks(ft)
+    nmeas = int(bp[2].sum()) if bp is not None else bins
+    if nmeas < bins / 2:
+        logging.getLogger("saltrss").warning(
+            "Only %d of %d trace bins could be measured (faint or undetected object); "
+            "using a straight trace at row %.1f", nmeas, bins, guess)
+        positions = np.full(nx, float(guess))
+    elif np.any(np.abs(positions - guess) > window):
         logging.getLogger("saltrss").warning(
             "Trace fit wandered %.0f rows from the guess (faint or undetected object); "
             "using a straight trace at row %.1f", np.nanmax(np.abs(positions - guess)), guess)
         positions = np.full(nx, float(guess))
-    return TraceResult(positions=positions, fwhm=fwhm, guess=float(guess), profile=prof, peaks=peaks)
+    return TraceResult(positions=positions, fwhm=fwhm, guess=float(guess), profile=prof, peaks=peaks,
+                       rows=(lo, hi) if trace_rows is not None else None)
 
 
 def _to_spectrum(flux, variance, wave, gpm, meta, unit="count") -> Spectrum1D:
@@ -257,7 +327,8 @@ def horne_extract(data: np.ndarray, var: np.ndarray, bad: np.ndarray, positions:
 def extract(frame: Frame2D, trace: TraceResult | None = None, method: str = "horne",
             aperture_fwhm: float = 2.5, sky_sep_fwhm: float = 3.0, sky_width: float = 30.0,
             profile_order: int = 4, trace_guess: float | None = None,
-            subtract_sky: bool = True, min_aperture: float = 4.0, **trace_kwargs) -> ExtractionResult:
+            subtract_sky: bool = True, min_aperture: float = 4.0,
+            sky_rows: Sequence[tuple[int, int]] | None = None, **trace_kwargs) -> ExtractionResult:
     """Sky-subtract and extract a 1D spectrum from a rectified frame.
 
     Parameters
@@ -270,9 +341,20 @@ def extract(frame: Frame2D, trace: TraceResult | None = None, method: str = "hor
         Sky windows start ``sky_sep_fwhm * FWHM`` rows from the trace on either
         side and are ``sky_width`` rows wide (`specreduce.background.Background`,
         column-wise sigma-clipped median).
+    sky_rows : sequence of (int, int), optional
+        Explicit sky windows replacing the automatic ones: inclusive row ranges
+        such as ``[(499, 504), (519, 524)]``, any number and width, on either side
+        of the trace (e.g. to keep a nearby star out of the sky).  The rows apply
+        at the trace's median row; along the dispersion axis the windows move with
+        the trace in whole rows, so a tilted trace keeps its clearance.
     profile_order : int
         Polynomial order (along dispersion) used to smooth the empirical spatial profile.
+    **trace_kwargs
+        Passed to :func:`find_trace` (e.g. ``trace_rows``) when ``trace`` is not given.
     """
+    import logging
+
+    log = logging.getLogger("saltrss")
     if trace is None:
         trace = find_trace(frame, guess=trace_guess, **trace_kwargs)
     fwhm = max(trace.fwhm, 1.5)
@@ -282,6 +364,13 @@ def extract(frame: Frame2D, trace: TraceResult | None = None, method: str = "hor
     center = trace.center
     r0 = int(max(np.floor(center - half), 0))
     r1 = int(min(np.ceil(center + half) + 1, frame.shape[0]))
+    if sky_rows is not None:
+        sky_rows = [row_range(w, frame.shape[0], "sky_rows") for w in sky_rows]
+        if not sky_rows:
+            raise ValueError("sky_rows is empty; pass subtract_sky=False to skip sky subtraction")
+        shift = np.rint(trace.positions - center)  # whole-row offsets of the trace along dispersion
+        r0 = int(max(min(r0, min(w[0] for w in sky_rows) + shift.min()), 0))
+        r1 = int(min(max(r1, max(w[1] for w in sky_rows) + shift.max() + 1), frame.shape[0]))
     cut = frame.cutout(r0, r1)
     nd = cut.to_nddata()
     tr = ArrayTrace(nd, trace.positions - r0)
@@ -289,27 +378,44 @@ def extract(frame: Frame2D, trace: TraceResult | None = None, method: str = "hor
     sky_spec = None
     windows = None
     if subtract_sky:
-        # specreduce centres each window on trace +/- separation with total width `width`,
-        # so the inner edge sits `sep` rows from the trace when separation = sep + width/2.
-        pos = trace.positions - r0
-        ncut = cut.shape[0]
-        lo_room = float(np.nanmin(pos) - sep)               # rows available below the inner edge
-        hi_room = float(ncut - 1 - (np.nanmax(pos) + sep))  # rows available above
-        widths = [w for w in (min(sky_width, lo_room), min(sky_width, hi_room)) if w >= 5]
         traces = []
         windows = []
-        if widths:
-            width = float(min(widths))
-            if lo_room >= 5:
-                traces.append(tr - (sep + width / 2))
-                windows.append((center - sep - width, center - sep))
-            if hi_room >= 5:
-                traces.append(tr + (sep + width / 2))
-                windows.append((center + sep, center + sep + width))
+        if sky_rows is not None:
+            # Background takes one width for all its windows, so each sky row gets its own
+            # 1-row window; whole-row offsets from the trace make them tile exactly.
+            rows = np.unique(np.concatenate([np.arange(a, b + 1) for a, b in sky_rows]))
+            traces = [ArrayTrace(nd, shift + float(r - r0)) for r in rows]
+            for t in traces:
+                t.shift(0.0)  # leaves the masked array Background expects (as `tr +/- x` does)
+            width = 1.0
+            windows = [(float(a), float(b)) for a, b in sky_rows]
+            inside = rows[np.abs(rows - center) <= ap / 2]
+            if inside.size:
+                log.warning("Sky row(s) %s lie inside the %.1f-row object aperture around row %.1f",
+                            inside.tolist(), ap, center)
+        else:
+            # specreduce centres each window on trace +/- separation with total width `width`,
+            # so the inner edge sits `sep` rows from the trace when separation = sep + width/2.
+            pos = trace.positions - r0
+            ncut = cut.shape[0]
+            lo_room = float(np.nanmin(pos) - sep)               # rows available below the inner edge
+            hi_room = float(ncut - 1 - (np.nanmax(pos) + sep))  # rows available above
+            widths = [w for w in (min(sky_width, lo_room), min(sky_width, hi_room)) if w >= 5]
+            if widths:
+                width = float(min(widths))
+                if lo_room >= 5:
+                    traces.append(tr - (sep + width / 2))
+                    windows.append((center - sep - width, center - sep))
+                if hi_room >= 5:
+                    traces.append(tr + (sep + width / 2))
+                    windows.append((center + sep, center + sep + width))
+        others = [round(p) for p in trace.peaks
+                  if abs(p - center) > ap / 2 and any(a <= p <= b for a, b in windows)]
+        if others:
+            log.warning("Object(s) at row(s) %s fall in the sky windows %s; pass sky_rows to choose clean ones",
+                        others, [(round(a), round(b)) for a, b in windows])
         if not traces:
-            import logging
-
-            logging.getLogger("saltrss").warning("No room for sky windows around row %.0f; no sky subtraction", center)
+            log.warning("No room for sky windows around row %.0f; no sky subtraction", center)
             windows = None
         else:
             bg = Background(nd, traces=traces, width=width, statistic="median", sigma=3.0)
@@ -353,4 +459,5 @@ def extract(frame: Frame2D, trace: TraceResult | None = None, method: str = "hor
     spectrum = _to_spectrum(flux, var, frame.wave, colgood, meta)
     return ExtractionResult(spectrum=spectrum, trace=trace, sky=sky_spec, sky_windows=windows,
                             aperture=ap_used,
-                            meta={"cutout_rows": (r0, r1), "sky_sep": sep, "sky_width": sky_width})
+                            meta={"cutout_rows": (r0, r1), "sky_sep": sep, "sky_width": sky_width,
+                                  "sky_rows": sky_rows})
