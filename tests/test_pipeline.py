@@ -61,6 +61,19 @@ def test_reduce_frame_end_to_end(synthetic_product, sens_file, tmp_path):
     assert "trace row" in res.summary()
 
 
+def test_reduce_frame_with_trace_and_sky_rows(synthetic_product, sens_file, tmp_path):
+    pd = ProductDir(synthetic_product)
+    res = pipeline.reduce_frame(pd.science_frames[0].path, pd, output=tmp_path / "t.csv", sensfunc_file=sens_file,
+                                telluric="none", trace_rows=(45, 75), sky_rows=[(25, 40), (80, 95)],
+                                write_fits=True, qa_plot=True)
+    ex = res.extraction
+    assert ex.trace.rows == (45, 75) and abs(ex.trace.center - 60) < 1
+    assert ex.sky_windows == ((25.0, 40.0), (80.0, 95.0))
+    with fits.open(res.outputs["fits"]) as h:
+        assert h[0].header["TRCROWS"] == "45:75" and h[0].header["SKYROWS"] == "25:40,80:95"
+    assert res.outputs["qa_plot"].exists()
+
+
 def test_reduce_directory_with_combination(synthetic_product, sens_file, tmp_path):
     results = pipeline.reduce(synthetic_product, tmp_path, sensfunc_file=sens_file, telluric="none",
                               write_fits=False, qa_plot=False)
@@ -126,3 +139,18 @@ def test_reduce_continues_after_frame_failure(synthetic_product, sens_file, tmp_
     results = pl.reduce(synthetic_product, tmp_path, sensfunc_file=sens_file, telluric="none",
                         write_fits=False, qa_plot=False)
     assert len(results) == 1 and len(calls) == 2
+
+
+@pytest.mark.realdata
+@pytest.mark.parametrize("pattern", ["2026ofr/*/mbxgpP202606170106_bp_ag_ff_cr_cg_wr.fits",
+                                     "LRD28156/*/mbxgpP202607090058_bp_ag_ff_cr_cg_wr.fits"])
+def test_real_undetected_target_gets_a_straight_trace(pattern):
+    """Most FitTrace bins fail on these frames: no tilt is invented from the few that do not."""
+    from saltrss.extract import find_trace
+    from saltrss.frames import load_science_frame
+
+    paths = sorted(REAL_DATA.glob(pattern))
+    if not paths:
+        pytest.skip("real SALT data not available")
+    tr = find_trace(load_science_frame(paths[0]))
+    assert np.all(tr.positions == tr.guess)

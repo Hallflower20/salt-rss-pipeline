@@ -36,6 +36,10 @@ def write_fits_result(result, path: Path | str) -> None:
         hdr["EBV"] = result.ebv
     hdr["TRACEROW"] = float(result.extraction.trace.center)
     hdr["FWHMPIX"] = float(result.extraction.trace.fwhm)
+    if result.extraction.trace.rows is not None:
+        hdr["TRCROWS"] = ("%d:%d" % result.extraction.trace.rows, "rows the trace was confined to")
+    if result.extraction.meta.get("sky_rows"):
+        hdr["SKYROWS"] = (",".join("%d:%d" % w for w in result.extraction.meta["sky_rows"]), "sky rows")
 
     def tab(spec, extra=None):
         t = spec.to_table(nan_bad=False)

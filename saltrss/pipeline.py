@@ -151,6 +151,7 @@ def reduce_frame(frame_path, product: ProductDir | str | Path, *, output=None, o
                  deredden: bool = False, ebv: float | None = None, dustmap: str = "sfd", r_v: float = 3.1,
                  extinction_law: str = "fitzpatrick99", trace_guess: float | None = None,
                  target_selection: str = "expected", expected_row: float | None = None,
+                 trace_rows: tuple[int, int] | None = None, sky_rows: list[tuple[int, int]] | None = None,
                  extract_method: str = "horne", aperture_fwhm: float = 2.5, sky_sep_fwhm: float = 3.0,
                  sky_width: float = 30.0, profile_order: int = 4, readnoise: float = DEFAULT_READNOISE,
                  atm_extinction: str | None = None, write_fits: bool = True, qa_plot: bool = True,
@@ -176,6 +177,13 @@ def reduce_frame(frame_path, product: ProductDir | str | Path, *, output=None, o
         Which object on the slit to extract (see :func:`saltrss.extract.find_trace`).
         By default the brightest peak within 60 rows of the standard star's row
         (or the slit centre) is taken.
+    trace_rows, sky_rows
+        Rows of the science frame (0-based, in its binning) that hold the target, and
+        explicit sky windows, for when a brighter star sits next to it: the trace is
+        searched for and fitted within ``trace_rows`` only, and the sky comes from
+        ``sky_rows`` instead of the automatic windows.  See
+        :func:`saltrss.extract.find_trace` and :func:`saltrss.extract.extract`.
+        They apply to the science frame only, not to the standard star.
     extract_method, aperture_fwhm, sky_sep_fwhm, sky_width, profile_order
         Extraction controls (see :func:`saltrss.extract.extract`).
     atm_extinction : str, optional
@@ -219,7 +227,8 @@ def reduce_frame(frame_path, product: ProductDir | str | Path, *, output=None, o
             float(sensfunc.meta.get("std_ybin", info.config.ybin)) / info.config.ybin
     ex = extract(frame, trace_guess=trace_guess, method=extract_method, aperture_fwhm=aperture_fwhm,
                  sky_sep_fwhm=sky_sep_fwhm, sky_width=sky_width, profile_order=profile_order,
-                 expected_row=expected_row, target_selection=target_selection)
+                 expected_row=expected_row, target_selection=target_selection,
+                 trace_rows=trace_rows, sky_rows=sky_rows)
     counts = ex.spectrum
     counts.meta["resolution"] = _resolution(info, counts)
 
